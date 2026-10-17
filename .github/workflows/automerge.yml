@@ -20,9 +20,11 @@ name: Auto-merge
 #     or collaborator (changes to workflows from outside could leak secrets
 #     once merged, so a maintainer must merge those by hand)
 #
-# Merges made with GITHUB_TOKEN do not start other workflows, so after merging
-# this workflow dispatches the listed workflows on the default branch and, if
-# asked, requests a GitHub Pages build.
+# Merges made with GITHUB_TOKEN do not start other workflows and do not apply
+# a PR's "Closes #n" keywords. So after merging, this workflow closes the
+# linked issues itself (Drips Wave awards points for resolved issues),
+# dispatches the listed workflows on the default branch and, if asked,
+# requests a GitHub Pages build.
 
 on:
   workflow_call:
@@ -111,6 +113,40 @@ jobs:
               await github.rest.issues.createComment({ owner, repo, issue_number: number, body: `${marker}\n${text}` });
             }
 
+            // GitHub does not apply "Closes #n" when the merge is made with
+            // GITHUB_TOKEN, so issues linked to a PR this workflow merged
+            // would stay open. Drips Wave awards points for resolved issues,
+            // so close each linked issue in this repository explicitly.
+            async function closeLinkedIssues(pr) {
+              const { repository } = await github.graphql(
+                `query($owner: String!, $repo: String!, $number: Int!) {
+                   repository(owner: $owner, name: $repo) {
+                     pullRequest(number: $number) {
+                       closingIssuesReferences(first: 50) {
+                         nodes { number state repository { nameWithOwner } }
+                       }
+                     }
+                   }
+                 }`,
+                { owner, repo, number: pr.number });
+              const linked = repository.pullRequest.closingIssuesReferences.nodes
+                .filter((i) => i.state === "OPEN" && i.repository.nameWithOwner === `${owner}/${repo}`);
+              const closed = [];
+              for (const issue of linked) {
+                try {
+                  await github.rest.issues.createComment({
+                    owner, repo, issue_number: issue.number,
+                    body: `Resolved by #${pr.number} (@${pr.user.login}), merged after all CI checks passed. Thank you!`,
+                  });
+                  await github.rest.issues.update({ owner, repo, issue_number: issue.number, state: "closed", state_reason: "completed" });
+                  closed.push(issue.number);
+                } catch (e) {
+                  core.warning(`#${pr.number}: could not close linked issue #${issue.number}: ${e.message}`);
+                }
+              }
+              return closed;
+            }
+
             async function evaluate(number) {
               const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: number });
               const result = (merged, reason) => ({ number, title: pr.title, author: pr.user.login, merged, reason });
@@ -186,7 +222,8 @@ jobs:
               }
               await notifyOnce(number, "merged",
                 `All ${checks.length} CI checks passed on ${sha.slice(0, 7)}, so this was merged automatically. Thank you for the contribution!`);
-              return result(true, `merged (${checks.length} checks passed)`);
+              const closed = await closeLinkedIssues(pr);
+              return result(true, `merged (${checks.length} checks passed)${closed.length ? `; closed ${closed.map((n) => `#${n}`).join(", ")}` : ""}`);
             }
 
             const results = [];

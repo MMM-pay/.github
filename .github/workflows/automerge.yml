@@ -1,0 +1,228 @@
+name: Auto-merge
+
+# Reusable workflow: merges open pull requests whose CI has passed.
+#
+# Each repository calls it from its own `.github/workflows/automerge.yml`, so
+# the rules live in one place. The workflow never checks out or runs code from
+# a pull request; it only reads pull request data through the API. That is
+# what makes it safe to run on `pull_request_target` and `workflow_run`, which
+# carry a token with write access.
+#
+# A pull request is merged when all of these hold:
+#   - it is open, not a draft, and targets the default branch
+#   - it has none of the skip labels
+#   - it has no merge conflicts
+#   - no maintainer's latest review requests changes, and it has the required
+#     number of maintainer approvals (0 by default)
+#   - every check run on its head commit has finished as success, neutral or
+#     skipped, every commit status is success, and there is at least one check
+#   - if it changes anything under `.github/`, its author is an owner, member
+#     or collaborator (changes to workflows from outside could leak secrets
+#     once merged, so a maintainer must merge those by hand)
+#
+# Merges made with GITHUB_TOKEN do not start other workflows, so after merging
+# this workflow dispatches the listed workflows on the default branch and, if
+# asked, requests a GitHub Pages build.
+
+on:
+  workflow_call:
+    inputs:
+      merge_method:
+        description: squash, merge or rebase
+        type: string
+        default: squash
+      post_merge_workflows:
+        description: Comma-separated workflow files to dispatch on the default branch after a merge
+        type: string
+        default: ""
+      request_pages_build:
+        description: Request a GitHub Pages build after a merge (branch-based Pages)
+        type: boolean
+        default: false
+      approve_fork_runs:
+        description: Approve CI runs that GitHub holds for first-time contributors, unless the PR changes .github/
+        type: boolean
+        default: true
+      skip_labels:
+        description: Comma-separated labels that stop a PR from being merged
+        type: string
+        default: "do-not-merge,no-automerge,wip"
+      required_approvals:
+        description: Maintainer approvals needed before merging
+        type: number
+        default: 0
+      min_checks:
+        description: Minimum number of finished check runs (protects against merging before CI starts)
+        type: number
+        default: 1
+      dry_run:
+        description: Report what would be merged without merging
+        type: boolean
+        default: false
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          MERGE_METHOD: ${{ inputs.merge_method }}
+          POST_MERGE: ${{ inputs.post_merge_workflows }}
+          PAGES_BUILD: ${{ inputs.request_pages_build }}
+          APPROVE_FORK_RUNS: ${{ inputs.approve_fork_runs }}
+          SKIP_LABELS: ${{ inputs.skip_labels }}
+          REQUIRED_APPROVALS: ${{ inputs.required_approvals }}
+          MIN_CHECKS: ${{ inputs.min_checks }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const env = process.env;
+            const cfg = {
+              method: env.MERGE_METHOD || "squash",
+              postMerge: (env.POST_MERGE || "").split(",").map((s) => s.trim()).filter(Boolean),
+              pagesBuild: env.PAGES_BUILD === "true",
+              approveForks: env.APPROVE_FORK_RUNS === "true",
+              skipLabels: new Set((env.SKIP_LABELS || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean)),
+              approvals: Number(env.REQUIRED_APPROVALS || 0),
+              minChecks: Number(env.MIN_CHECKS || 1),
+              dryRun: env.DRY_RUN === "true",
+            };
+            const TRUSTED = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
+            const PASSING = new Set(["success", "neutral", "skipped"]);
+            // This workflow's own check run must not count as CI.
+            const SELF = /auto-?merge/i;
+            const MARK = "<!-- automerge-bot:";
+
+            const { data: repoInfo } = await github.rest.repos.get({ owner, repo });
+            const base = repoInfo.default_branch;
+
+            // Whatever triggered the run, evaluate every open PR. Runs are
+            // serialised by the caller's concurrency group, and a queued run
+            // can replace another, so looking at all of them means no PR is
+            // forgotten.
+            const open = await github.paginate(github.rest.pulls.list, { owner, repo, state: "open", per_page: 100 });
+
+            async function notifyOnce(number, key, text) {
+              const marker = `${MARK}${key} -->`;
+              const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: number, per_page: 100 });
+              if (comments.some((c) => (c.body || "").includes(marker))) return;
+              if (cfg.dryRun) return core.info(`#${number}: would comment (${key})`);
+              await github.rest.issues.createComment({ owner, repo, issue_number: number, body: `${marker}\n${text}` });
+            }
+
+            async function evaluate(number) {
+              const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: number });
+              const result = (merged, reason) => ({ number, title: pr.title, author: pr.user.login, merged, reason });
+              const sha = pr.head.sha;
+
+              if (pr.state !== "open") return result(false, "not open");
+              if (pr.draft) return result(false, "draft");
+              if (pr.base.ref !== base) return result(false, `targets ${pr.base.ref}, not ${base}`);
+
+              const label = pr.labels.map((l) => l.name.toLowerCase()).find((l) => cfg.skipLabels.has(l));
+              if (label) return result(false, `has label "${label}"`);
+
+              const files = await github.paginate(github.rest.pulls.listFiles, { owner, repo, pull_number: number, per_page: 100 });
+              const touchesGithub = files.some((f) => f.filename.startsWith(".github/") || (f.previous_filename || "").startsWith(".github/"));
+              const trusted = TRUSTED.has(pr.author_association);
+              if (touchesGithub && !trusted) {
+                await notifyOnce(number, "github-dir",
+                  "This pull request changes files under `.github/` (workflows or repository settings), so it will not be merged automatically. A maintainer will review and merge it.");
+                return result(false, "changes .github/; needs a maintainer");
+              }
+
+              const fromFork = !pr.head.repo || pr.head.repo.full_name !== `${owner}/${repo}`;
+              if (cfg.approveForks && fromFork) {
+                const held = await github.paginate(github.rest.actions.listWorkflowRunsForRepo,
+                  { owner, repo, head_sha: sha, status: "action_required", per_page: 100 });
+                for (const run of held) {
+                  if (cfg.dryRun) { core.info(`#${number}: would approve run ${run.id} (${run.name})`); continue; }
+                  await github.request("POST /repos/{owner}/{repo}/actions/runs/{run_id}/approve", { owner, repo, run_id: run.id });
+                  core.info(`#${number}: approved held run ${run.id} (${run.name})`);
+                }
+                if (held.length) return result(false, `approved ${held.length} held CI run(s); waiting for them`);
+              }
+
+              if (pr.mergeable === null) return result(false, "GitHub is still computing mergeability; will retry");
+              if (pr.mergeable === false || pr.mergeable_state === "dirty") {
+                await notifyOnce(number, `conflict:${sha}`,
+                  `This pull request has merge conflicts with \`${base}\`. Please merge \`${base}\` into your branch (or rebase) and push. It will be merged automatically once CI passes.`);
+                return result(false, "merge conflicts");
+              }
+
+              const reviews = await github.paginate(github.rest.pulls.listReviews, { owner, repo, pull_number: number, per_page: 100 });
+              const latest = new Map();
+              for (const r of reviews) {
+                if (!TRUSTED.has(r.author_association) || r.state === "COMMENTED") continue;
+                latest.set(r.user.login, r.state);
+              }
+              const states = [...latest.values()];
+              if (states.includes("CHANGES_REQUESTED")) return result(false, "a maintainer requested changes");
+              const approved = states.filter((s) => s === "APPROVED").length;
+              if (approved < cfg.approvals) return result(false, `needs ${cfg.approvals} maintainer approval(s), has ${approved}`);
+
+              const checks = (await github.paginate(github.rest.checks.listForRef,
+                { owner, repo, ref: sha, filter: "latest", per_page: 100 })).filter((c) => !SELF.test(c.name));
+              if (checks.length < cfg.minChecks) return result(false, "no CI checks on the latest commit yet");
+              const running = checks.filter((c) => c.status !== "completed");
+              if (running.length) return result(false, `waiting for ${running.map((c) => c.name).join(", ")}`);
+              const failing = checks.filter((c) => !PASSING.has(c.conclusion));
+              if (failing.length) return result(false, `failing: ${failing.map((c) => `${c.name} (${c.conclusion})`).join(", ")}`);
+
+              const { data: status } = await github.rest.repos.getCombinedStatusForRef({ owner, repo, ref: sha });
+              if (status.total_count > 0 && status.state !== "success") return result(false, `commit status is ${status.state}`);
+
+              if (cfg.dryRun) return result(false, `would merge (${checks.length} checks passed)`);
+              try {
+                // Passing the head sha makes GitHub refuse the merge if a new
+                // commit arrived after the checks above were read.
+                await github.rest.pulls.merge({
+                  owner, repo, pull_number: number, sha, merge_method: cfg.method,
+                  commit_title: `${pr.title} (#${number})`,
+                });
+              } catch (e) {
+                return result(false, `merge refused: ${e.message}`);
+              }
+              await notifyOnce(number, "merged",
+                `All ${checks.length} CI checks passed on ${sha.slice(0, 7)}, so this was merged automatically. Thank you for the contribution!`);
+              return result(true, `merged (${checks.length} checks passed)`);
+            }
+
+            const results = [];
+            for (const pr of open) {
+              try {
+                results.push(await evaluate(pr.number));
+              } catch (e) {
+                results.push({ number: pr.number, title: pr.title, author: pr.user.login, merged: false, reason: `error: ${e.message}` });
+              }
+            }
+            for (const r of results) core.info(`#${r.number} ${r.merged ? "MERGED" : "skipped"}: ${r.reason} | ${r.title}`);
+
+            const merged = results.filter((r) => r.merged);
+            if (merged.length && !cfg.dryRun) {
+              for (const workflow_id of cfg.postMerge) {
+                try {
+                  await github.rest.actions.createWorkflowDispatch({ owner, repo, workflow_id, ref: base });
+                  core.info(`dispatched ${workflow_id} on ${base}`);
+                } catch (e) {
+                  core.warning(`could not dispatch ${workflow_id}: ${e.message}`);
+                }
+              }
+              if (cfg.pagesBuild) {
+                try {
+                  await github.request("POST /repos/{owner}/{repo}/pages/builds", { owner, repo });
+                  core.info("requested a Pages build");
+                } catch (e) {
+                  core.warning(`could not request a Pages build: ${e.message}`);
+                }
+              }
+            }
+
+            await core.summary
+              .addHeading(`Auto-merge: ${merged.length} merged, ${results.length - merged.length} waiting${cfg.dryRun ? " (dry run)" : ""}`)
+              .addTable([
+                [{ data: "PR", header: true }, { data: "Author", header: true }, { data: "Result", header: true }, { data: "Title", header: true }],
+                ...results.map((r) => [`#${r.number}`, r.author, r.reason, r.title]),
+              ])
+              .write();

@@ -1,0 +1,18 @@
+title = "MMM-pay Gitleaks configuration"
+
+# Start from Gitleaks' built-in rules.
+[extend]
+useDefault = true
+
+# Public Stellar addresses are 56-character base32 strings (accounts start with
+# G, contracts with C, muxed accounts with M), so the generic API key rule
+# reports them. They are public by design and appear in tests, configuration
+# and docs. Stellar *secret* keys start with S and are not allowlisted here;
+# scan.py also detects them, verifying their checksum.
+[[allowlists]]
+description = "Public Stellar account, contract and muxed addresses"
+regexTarget = "secret"
+regexes = [
+  '''(?i)^[GC][A-Z2-7]{55}$''',
+  '''(?i)^M[A-Z2-7]{68}$''',
+]

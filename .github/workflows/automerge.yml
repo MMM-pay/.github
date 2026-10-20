@@ -72,6 +72,10 @@ on:
         description: Workflow file that runs the malware scan; dispatched for PRs that have no scan result yet
         type: string
         default: security.yml
+      scanner_ref:
+        description: Scanner commit the callers' security.yml pins. A scan result stamped with another version is redone. Empty accepts any version.
+        type: string
+        default: ""
 
 jobs:
   merge:
@@ -89,6 +93,7 @@ jobs:
           DRY_RUN: ${{ inputs.dry_run }}
           SECURITY_CONTEXT: ${{ inputs.security_context }}
           SECURITY_WORKFLOW: ${{ inputs.security_workflow }}
+          SCANNER_REF: ${{ inputs.scanner_ref }}
         with:
           script: |
             const { owner, repo } = context.repo;
@@ -104,11 +109,15 @@ jobs:
               dryRun: env.DRY_RUN === "true",
               securityContext: (env.SECURITY_CONTEXT || "").trim(),
               securityWorkflow: (env.SECURITY_WORKFLOW || "").trim(),
+              scannerRef: (env.SCANNER_REF || "").trim(),
             };
             const TRUSTED = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
             const PASSING = new Set(["success", "neutral", "skipped"]);
-            // This workflow's own check run must not count as CI.
-            const SELF = /auto-?merge/i;
+            // Neither this workflow's own check run nor the malware scan's job
+            // counts as CI: the scan's verdict is its commit status (checked
+            // above), and a scan run cancelled by a newer push must not read
+            // as a failing check.
+            const SELF = /auto-?merge|malware-scan/i;
             const MARK = "<!-- automerge-bot:";
 
             const { data: repoInfo } = await github.rest.repos.get({ owner, repo });
@@ -189,7 +198,7 @@ jobs:
               if (cfg.securityContext) {
                 const { data: combined } = await github.rest.repos.getCombinedStatusForRef({ owner, repo, ref: sha });
                 const scanStatus = combined.statuses.find((s) => s.context === cfg.securityContext);
-                if (!scanStatus) {
+                const requestScan = async (why) => {
                   if (!cfg.dryRun && cfg.securityWorkflow) {
                     try {
                       await github.rest.actions.createWorkflowDispatch({
@@ -199,9 +208,21 @@ jobs:
                       core.warning(`#${number}: could not start the malware scan: ${e.message}`);
                     }
                   }
-                  return result(false, "malware scan requested; waiting for it");
+                  return result(false, `malware scan requested (${why}); waiting for it`);
+                };
+                if (!scanStatus) return requestScan("no scan yet");
+                if (scanStatus.state === "pending") {
+                  // A scan that never reported back (cancelled or crashed before
+                  // its last step) would otherwise hold the PR forever.
+                  const age = Date.now() - new Date(scanStatus.updated_at).getTime();
+                  if (age > 60 * 60 * 1000) return requestScan("previous scan never finished");
+                  return result(false, "malware scan running");
                 }
-                if (scanStatus.state === "pending") return result(false, "malware scan running");
+                // A result from an older scanner version: scan again so updated
+                // rules (new detections, fixed false positives) apply.
+                if (cfg.scannerRef && !(scanStatus.description || "").includes(`[scanner ${cfg.scannerRef.slice(0, 7)}]`)) {
+                  return requestScan("scanner was updated");
+                }
                 if (scanStatus.state !== "success") {
                   return result(false, `malware scan ${scanStatus.state}: ${scanStatus.description || "see the scan report"}`);
                 }

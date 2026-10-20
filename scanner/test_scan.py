@@ -98,6 +98,14 @@ class ScanTest(unittest.TestCase):
         self.repo.write("src/auth.ts", 'const isAdmin = false; /* \u202e } \u2066if (isAdmin)\u2069 \u2066 begin admins only */\n')
         self.assertBlocks("trojan-source", self.repo.scan())
 
+    def test_byte_order_mark_at_file_start_is_allowed(self):
+        self.repo.write("src/bom.ts", '﻿"use client";\nexport const x = 1;\n')
+        self.assertEqual(self.repo.scan().findings, [])
+
+    def test_byte_order_mark_mid_file_is_reported(self):
+        self.repo.write("src/bom.ts", 'export const x = 1;\nconst y﻿ = 2;\n')
+        self.assertReviews("invisible-char", self.repo.scan())
+
     def test_zero_width_character(self):
         self.repo.write("src/a.ts", "const a\u200b = 1;\n")
         self.assertReviews("invisible-char", self.repo.scan())

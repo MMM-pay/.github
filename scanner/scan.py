@@ -318,6 +318,10 @@ def levenshtein(a: str, b: str) -> int:
 def scan_lines(report, path, lines):
     js_text = []
     for num, text in lines:
+        if num == 1 and text.startswith("﻿"):
+            # A UTF-8 byte-order mark at the very start of a file is an editor
+            # artifact, not hidden code. Anywhere else it is still reported.
+            text = text[1:]
         for rule, sev, rx, msg, applies in LINE_RULES:
             if applies(path) and rx.search(text):
                 report.add(sev, rule, path, num, msg, text)

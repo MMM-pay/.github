@@ -16,6 +16,9 @@ name: Auto-merge
 #     number of maintainer approvals (0 by default)
 #   - every check run on its head commit has finished as success, neutral or
 #     skipped, every commit status is success, and there is at least one check
+#   - the malware scan (`payflow/malware-scan`, see malware-scan.yml) has
+#     passed on its head commit. Held CI runs from first-time contributors are
+#     only approved after that, so no PR code runs before it has been scanned
 #   - if it changes anything under `.github/`, its author is an owner, member
 #     or collaborator (changes to workflows from outside could leak secrets
 #     once merged, so a maintainer must merge those by hand)
@@ -61,6 +64,14 @@ on:
         description: Report what would be merged without merging
         type: boolean
         default: false
+      security_context:
+        description: Commit status the malware scan sets; must be success before CI is approved or the PR merged. Empty disables the gate.
+        type: string
+        default: payflow/malware-scan
+      security_workflow:
+        description: Workflow file that runs the malware scan; dispatched for PRs that have no scan result yet
+        type: string
+        default: security.yml
 
 jobs:
   merge:
@@ -76,6 +87,8 @@ jobs:
           REQUIRED_APPROVALS: ${{ inputs.required_approvals }}
           MIN_CHECKS: ${{ inputs.min_checks }}
           DRY_RUN: ${{ inputs.dry_run }}
+          SECURITY_CONTEXT: ${{ inputs.security_context }}
+          SECURITY_WORKFLOW: ${{ inputs.security_workflow }}
         with:
           script: |
             const { owner, repo } = context.repo;
@@ -89,6 +102,8 @@ jobs:
               approvals: Number(env.REQUIRED_APPROVALS || 0),
               minChecks: Number(env.MIN_CHECKS || 1),
               dryRun: env.DRY_RUN === "true",
+              securityContext: (env.SECURITY_CONTEXT || "").trim(),
+              securityWorkflow: (env.SECURITY_WORKFLOW || "").trim(),
             };
             const TRUSTED = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
             const PASSING = new Set(["success", "neutral", "skipped"]);
@@ -166,6 +181,30 @@ jobs:
                 await notifyOnce(number, "github-dir",
                   "This pull request changes files under `.github/` (workflows or repository settings), so it will not be merged automatically. A maintainer will review and merge it.");
                 return result(false, "changes .github/; needs a maintainer");
+              }
+
+              // Malware gate. It runs before anything from the PR executes:
+              // contributors' CI is only approved, and the PR only merged,
+              // once the scan of this exact head commit has passed.
+              if (cfg.securityContext) {
+                const { data: combined } = await github.rest.repos.getCombinedStatusForRef({ owner, repo, ref: sha });
+                const scanStatus = combined.statuses.find((s) => s.context === cfg.securityContext);
+                if (!scanStatus) {
+                  if (!cfg.dryRun && cfg.securityWorkflow) {
+                    try {
+                      await github.rest.actions.createWorkflowDispatch({
+                        owner, repo, workflow_id: cfg.securityWorkflow, ref: base, inputs: { pr: String(number) },
+                      });
+                    } catch (e) {
+                      core.warning(`#${number}: could not start the malware scan: ${e.message}`);
+                    }
+                  }
+                  return result(false, "malware scan requested; waiting for it");
+                }
+                if (scanStatus.state === "pending") return result(false, "malware scan running");
+                if (scanStatus.state !== "success") {
+                  return result(false, `malware scan ${scanStatus.state}: ${scanStatus.description || "see the scan report"}`);
+                }
               }
 
               const fromFork = !pr.head.repo || pr.head.repo.full_name !== `${owner}/${repo}`;

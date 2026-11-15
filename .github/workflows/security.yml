@@ -1,0 +1,51 @@
+name: Security
+
+# Scans every pull request to this repository for malware, obfuscation,
+# supply-chain attacks, leaked secrets and workflow injection before anything
+# from it runs — the same scan every other MMM-pay repository runs. This
+# repository holds the scanner and the shared workflows, so a malicious change
+# here would reach every repository; its own pull requests deserve the scan
+# most of all.
+#
+# pull_request_target runs this file from the base branch, so a pull request
+# cannot change how it is scanned. Nothing from the pull request is executed.
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Pull request number to scan
+        required: true
+        type: number
+
+permissions:
+  contents: read # check out the base branch and fetch the PR's commits as data
+  statuses: write # set payflow/malware-scan on the PR's head commit
+  pull-requests: write # comment the findings on the PR
+  issues: write # add or remove the security-review label
+  actions: write # start auto-merge once the scan passes
+
+concurrency:
+  group: security-${{ github.event.pull_request.number || inputs.pr }}
+  cancel-in-progress: true
+
+jobs:
+  security:
+    permissions:
+      contents: read
+      statuses: write
+      pull-requests: write
+      issues: write
+      actions: write
+    # Pinned to a reviewed commit, like the callers in the other repositories.
+    # The scanner script is taken from the same commit.
+    uses: MMM-pay/.github/.github/workflows/malware-scan.yml@3c9de7c464f7d199f4c2dc6d3738a38934df7bec # main
+    with:
+      # workflow_dispatch passes the number as text; the shared workflow takes a number.
+      pr: ${{ fromJSON(format('{0}', github.event.pull_request.number || inputs.pr)) }}
+      scanner_ref: 3c9de7c464f7d199f4c2dc6d3738a38934df7bec
+      # This repository has no auto-merge: changes to the scanner and the
+      # shared workflows are merged by hand after review.
+      automerge_workflow: ""

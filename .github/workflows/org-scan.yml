@@ -1,0 +1,149 @@
+name: Org scan
+
+# Weekly full scan of every MMM-pay repository: known-malicious and vulnerable
+# packages in the lockfiles (OSV) and leaked secrets anywhere in the full git
+# history (gitleaks). The pull request scan (malware-scan.yml) guards what is
+# about to land; this one re-checks what has already landed, so a package that
+# is discovered to be malicious after it was merged, or a direct push that
+# skipped review, still gets caught within a week.
+#
+# Each repository is checked out as data; nothing from it is installed,
+# built or executed. On findings the job fails and opens (or updates) an
+# issue in this repository; a clean scan closes it.
+
+on:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays 06:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  OSV_VERSION: v2.7.0
+  GITLEAKS_VERSION: "8.30.1"
+
+jobs:
+  scan:
+    name: scan-${{ matrix.repo }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        repo: [payflow-frontend, payflow-backend, payflow-docs, payflow-contract, .github]
+    steps:
+      - name: Check out the scanner config (this repository)
+        uses: actions/checkout@v4
+        with:
+          path: scanner
+          persist-credentials: false
+
+      - name: Check out ${{ matrix.repo }} as data
+        uses: actions/checkout@v4
+        with:
+          repository: MMM-pay/${{ matrix.repo }}
+          path: target
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install scanners (pinned, checksums verified)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          BIN="$RUNNER_TEMP/bin"; mkdir -p "$BIN"; cd "$RUNNER_TEMP"
+          gh release download "$OSV_VERSION" -R google/osv-scanner -p osv-scanner_linux_amd64 -p osv-scanner_SHA256SUMS
+          grep " osv-scanner_linux_amd64\$" osv-scanner_SHA256SUMS | sha256sum --check -
+          install -m 0755 osv-scanner_linux_amd64 "$BIN/osv-scanner"
+          gh release download "v$GITLEAKS_VERSION" -R gitleaks/gitleaks \
+            -p "gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -p "gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          grep " gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz\$" "gitleaks_${GITLEAKS_VERSION}_checksums.txt" | sha256sum --check -
+          tar -xzf "gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -C "$BIN" gitleaks
+          echo "$BIN" >> "$GITHUB_PATH"
+
+      - name: OSV (malicious and vulnerable packages in the lockfiles)
+        run: |
+          set -uo pipefail
+          osv-scanner scan source -r --format json --output-file osv.json target 2> osv.err || true
+          if [ ! -s osv.json ]; then
+            if grep -qi "no package sources found" osv.err; then echo '{"results":[]}' > osv.json
+            else cat osv.err; echo '{"results":[]}' > osv.json; fi
+          fi
+
+      - name: Gitleaks (secrets anywhere in the full history)
+        run: |
+          gitleaks git --config scanner/scanner/gitleaks.toml \
+            --report-format json --report-path gitleaks.json \
+            --exit-code 0 --redact --no-banner target || true
+          [ -s gitleaks.json ] || echo '[]' > gitleaks.json
+
+      - name: Evaluate
+        id: evaluate
+        run: |
+          set -euo pipefail
+          MALICIOUS=$(jq '[.results[].packages[]?.vulnerabilities[]? | select(.id | startswith("MAL-"))] | length' osv.json)
+          VULNS=$(jq '[.results[].packages[]?.vulnerabilities[]? | select(.id | startswith("MAL-") | not)] | length' osv.json)
+          LEAKS=$(jq 'length' gitleaks.json)
+          {
+            echo "## ${{ matrix.repo }}"
+            echo "- Malicious packages: **$MALICIOUS**"
+            echo "- Leaked secrets in history: **$LEAKS**"
+            echo "- Known vulnerabilities (Dependabot's queue, informational): $VULNS"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$MALICIOUS" -gt 0 ]; then
+            jq -r '.results[].packages[]? | . as $p | .vulnerabilities[]? | select(.id | startswith("MAL-")) | "- `\($p.package.name)@\($p.package.version)`: \(.id)"' osv.json >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "malicious=$MALICIOUS" >> "$GITHUB_OUTPUT"
+          echo "leaks=$LEAKS" >> "$GITHUB_OUTPUT"
+
+      - name: Keep the reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: org-scan-${{ matrix.repo }}
+          path: |
+            osv.json
+            gitleaks.json
+          if-no-files-found: ignore
+
+      - name: Open or close the alarm issue
+        uses: actions/github-script@v7
+        env:
+          REPO: ${{ matrix.repo }}
+          MALICIOUS: ${{ steps.evaluate.outputs.malicious }}
+          LEAKS: ${{ steps.evaluate.outputs.leaks }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const target = process.env.REPO;
+            const bad = Number(process.env.MALICIOUS) + Number(process.env.LEAKS) > 0;
+            const MARK = `<!-- org-scan: ${target} -->`;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const issues = await github.paginate(github.rest.issues.listForRepo,
+              { owner, repo, state: "open", labels: "security-review", per_page: 100 });
+            const existing = issues.find((i) => (i.body || "").includes(MARK));
+            if (!bad) {
+              if (existing) {
+                await github.rest.issues.createComment({ owner, repo, issue_number: existing.number,
+                  body: `The weekly scan of \`${target}\` is clean again; closing. [Run](${runUrl})` });
+                await github.rest.issues.update({ owner, repo, issue_number: existing.number, state: "closed" });
+              }
+              return;
+            }
+            const body = [
+              MARK,
+              `The weekly scan found **${process.env.MALICIOUS} malicious package(s)** and ` +
+              `**${process.env.LEAKS} leaked secret(s) in history** in \`MMM-pay/${target}\`.`,
+              "",
+              `Details are in the run summary and the \`org-scan-${target}\` artifact: [run](${runUrl}).`,
+              "",
+              "Treat this as an incident: do not merge anything in that repository until it is resolved.",
+            ].join("\n");
+            if (existing) {
+              await github.rest.issues.createComment({ owner, repo, issue_number: existing.number, body });
+            } else {
+              await github.rest.issues.create({ owner, repo,
+                title: `Weekly scan findings in ${target}`, body, labels: ["security-review"] });
+            }
+            core.setFailed(`findings in ${target}`);

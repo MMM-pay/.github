@@ -16,3 +16,24 @@ regexes = [
   '''(?i)^[GC][A-Z2-7]{55}$''',
   '''(?i)^M[A-Z2-7]{68}$''',
 ]
+
+# payflow-backend's test suite signs against a fake RPC with this throwaway
+# testnet seed (test/sync.test.ts, commented as such there). It has been in
+# public history since 2026-10-09, holds nothing, and is listed literally so
+# every other S... seed still alerts.
+[[allowlists]]
+description = "The throwaway testnet seed in payflow-backend's tests"
+regexTarget = "secret"
+regexes = [
+  '''^SBK2VIYYSVG76E7VC3QHYARNFLY2EAQXDHRC7BMXBBGIFG74ARPRMNQM$''',
+]
+
+# When an example env file sets `SOME_SECRET=` to nothing, the generic rule
+# matches the keyword and then captures the *next* line's `VAR=number` as the
+# secret. A purely numeric setting is never a credential.
+[[allowlists]]
+description = "VAR=digits captured by the generic rule across lines"
+regexTarget = "secret"
+regexes = [
+  '''^[A-Za-z0-9_]+=[0-9]{1,16}$''',
+]

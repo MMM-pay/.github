@@ -41,11 +41,11 @@ jobs:
       actions: write
     # Pinned to a reviewed commit, like the callers in the other repositories.
     # The scanner script is taken from the same commit.
-    uses: MMM-pay/.github/.github/workflows/malware-scan.yml@3c9de7c464f7d199f4c2dc6d3738a38934df7bec # main
+    uses: MMM-pay/.github/.github/workflows/malware-scan.yml@85111c8e26a2f69f8d6206b8b83bfd840228c728 # main
     with:
       # workflow_dispatch passes the number as text; the shared workflow takes a number.
       pr: ${{ fromJSON(format('{0}', github.event.pull_request.number || inputs.pr)) }}
-      scanner_ref: 3c9de7c464f7d199f4c2dc6d3738a38934df7bec
+      scanner_ref: 85111c8e26a2f69f8d6206b8b83bfd840228c728
       # This repository has no auto-merge: changes to the scanner and the
       # shared workflows are merged by hand after review.
       automerge_workflow: ""
